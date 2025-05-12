@@ -47,6 +47,9 @@
 #include <math.h>
 #include <zlib.h>
 #include <curl/curl.h>
+#include <sys/file.h> 
+#include <unistd.h>
+#include <errno.h>
 
 #include "common_defs.h"
 #include "data_model.h"
@@ -85,6 +88,10 @@
 #define BULKDATA_HTTP_METHOD_PUT        "PUT"
 #define BULKDATA_DEFAULT_HTTP_METHOD    BULKDATA_HTTP_METHOD_POST
 #define BULKDATA_HTTP_METHODS_SUPPORTED BULKDATA_HTTP_METHOD_PUT ", " BULKDATA_HTTP_METHOD_POST
+
+// Definitions for file rotation
+#define BULKDATA_MAX_FILE_SIZE (10 * 1024 * 1024) // 10 MB
+#define BULKDATA_MAX_BACKUP_FILES 5
 
 //---------------------------------------------------------------------------------------------
 // Structure representing a report
@@ -125,6 +132,7 @@ static bulkdata_profile_t bulkdata_profiles[BULKDATA_MAX_PROFILES];
 #define BULKDATA_PROTOCOL_HTTP "HTTP"
 #define BULKDATA_PROTOCOL_USP_EVENT "USPEventNotif"
 #define BULKDATA_PROTOCOL_MQTT "MQTT"
+#define BULKDATA_PROTOCOL_FILE "FILE"
 
 typedef enum
 {
@@ -133,6 +141,7 @@ typedef enum
 #ifdef ENABLE_MQTT
     kBdcProtocol_MQTT,
 #endif
+    kBdcProtocol_File,
     kBdcProtocol_Max               // This should always be the last value in this enumeration. It is used to statically size arrays based on one entry for each active enumeration
 } bdc_protocol_t;
 
@@ -144,6 +153,7 @@ const enum_entry_t bdc_protocols[kBdcProtocol_Max] =
 #ifdef ENABLE_MQTT
     { kBdcProtocol_MQTT,               BULKDATA_PROTOCOL_MQTT },
 #endif
+    { kBdcProtocol_File,               BULKDATA_PROTOCOL_FILE },
 };
 
 //---------------------------------------------------------------------------------------------
@@ -173,6 +183,8 @@ typedef struct
     char compression[9];
     char method[9];
     bool use_date_header;
+    char file_path[1025]; // File path for FILE protocol
+    bool file_append;    // Append or overwrite for FILE protocol
 } profile_ctrl_params_t;
 
 //------------------------------------------------------------------------------
@@ -225,6 +237,7 @@ int Validate_BulkDataCompression(dm_req_t *req, char *value);
 int Validate_BulkDataHTTPMethod(dm_req_t *req, char *value);
 int Validate_BulkDataRetryMinimumWaitInterval(dm_req_t *req, char *value);
 int Validate_BulkDataRetryIntervalMultiplier(dm_req_t *req, char *value);
+int Validate_BulkDataFilePath(dm_req_t *req, char *value); // New validation for file path
 int NotifyChange_BulkDataGlobalEnable(dm_req_t *req, char *value);
 int NotifyChange_BulkDataProfileEnable(dm_req_t *req, char *value);
 int NotifyChange_BulkDataReportingInterval(dm_req_t *req, char *value);
@@ -243,6 +256,8 @@ int bulkdata_stop_profile(bulkdata_profile_t *bp);
 void bulkdata_process_profile(int id);
 void bulkdata_process_profile_http(bulkdata_profile_t *bp);
 void bulkdata_process_profile_usp_event(bulkdata_profile_t *bp);
+void bulkdata_process_profile_file(bulkdata_profile_t *bp);
+void bulkdata_rotate_file(char *file_path);
 bulkdata_profile_t *bulkdata_find_free_profile(void);
 bulkdata_profile_t *bulkdata_find_profile(int profile_id);
 int bulkdata_calc_report_map(bulkdata_profile_t *bp, kv_vector_t *report_map, combined_role_t *combined_role);
@@ -351,6 +366,10 @@ int DEVICE_BULKDATA_Init(void)
     err |= USP_REGISTER_Param_NumEntries("Device.BulkData.Profile.{i}.HTTP.RequestURIParameterNumberOfEntries", "Device.BulkData.Profile.{i}.HTTP.RequestURIParameter.{i}");
     err |= USP_REGISTER_DBParam_ReadWrite("Device.BulkData.Profile.{i}.HTTP.RequestURIParameter.{i}.Name", "", NULL, NULL, DM_STRING);
     err |= USP_REGISTER_DBParam_ReadWrite("Device.BulkData.Profile.{i}.HTTP.RequestURIParameter.{i}.Reference", "", Validate_BulkDataReference, NULL, DM_STRING);
+
+    // Device.BulkData.Profile.{i}.File
+    err |= USP_REGISTER_DBParam_ReadWrite("Device.BulkData.Profile.{i}.File.Path", "", Validate_BulkDataFilePath, NULL, DM_STRING);
+    err |= USP_REGISTER_DBParam_ReadWrite("Device.BulkData.Profile.{i}.File.Append", "false", NULL, NULL, DM_BOOL);
 
 #ifdef ENABLE_MQTT
     // Device.BulkData.Profile.{i}.MQTT
@@ -909,6 +928,42 @@ int Validate_BulkDataRetryMinimumWaitInterval(dm_req_t *req, char *value)
 int Validate_BulkDataRetryIntervalMultiplier(dm_req_t *req, char *value)
 {
     return DM_ACCESS_ValidateRange_Unsigned(req, 1000, 65535);
+}
+
+/*********************************************************************//**
+**
+** Validate_BulkDataFilePath
+**
+** Validates Device.BulkData.Profile.{i}.File.Path
+**
+** \param   req - pointer to structure identifying the parameter
+** \param   value - value that the controller would like to set the parameter to
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int Validate_BulkDataFilePath(dm_req_t *req, char *value)
+{
+    if (value[0] == '\0')
+    {
+        return USP_ERR_OK; // Empty path is allowed but will fail at runtime
+    }
+
+    // Check if the directory is writable
+    char *last_slash = strrchr(value, '/');
+    if (last_slash != NULL)
+    {
+        char dir_path[MAX_DM_PATH];
+        USP_STRNCPY(dir_path, value, last_slash - value + 1);
+        dir_path[last_slash - value] = '\0';
+        if (access(dir_path, W_OK) != 0)
+        {
+            USP_ERR_SetMessage("%s: Directory %s is not writable", __FUNCTION__, dir_path);
+            return USP_ERR_INVALID_VALUE;
+        }
+    }
+
+    return USP_ERR_OK;
 }
 
 #ifdef ENABLE_MQTT
@@ -2159,6 +2214,20 @@ int bulkdata_platform_get_profile_control_params(bulkdata_profile_t *bp, profile
         return err;
     }
 
+    // Get File Path
+    USP_SNPRINTF(path, sizeof(path), "Device.BulkData.Profile.%d.File.Path", bp->profile_id);
+    err = DATA_MODEL_GetParameterValue(path, ctrl_params->file_path, sizeof(ctrl_params->file_path), 0);
+    if (err != USP_ERR_OK)
+    {
+        return err;
+    }
+    USP_SNPRINTF(path, sizeof(path), "Device.BulkData.Profile.%d.File.Append", bp->profile_id);
+    err = DM_ACCESS_GetBool(path, &ctrl_params->file_append);
+    if (err != USP_ERR_OK)
+    {
+        return err;
+    }
+
 #ifdef ENABLE_MQTT
 {
     char protocol[32];
@@ -2472,6 +2541,10 @@ void bulkdata_process_profile(int id)
             bulkdata_process_profile_mqtt(bp);
             break;
 #endif
+        case kBdcProtocol_File:
+            bulkdata_process_profile_file(bp);
+            break;
+
         default:
             break;
     }
@@ -2671,6 +2744,219 @@ exit:
 
     // Uncomment the next line to see how much memory is in use by USP Agent after each post
 //    USP_MEM_PrintSummary();
+}
+
+/*********************************************************************//**
+**
+** bulkdata_process_profile_file
+**
+** Perform the work of processing a profile for FILE protocol
+**
+** \param   bp - pointer to bulk data profile to process
+** \return  None
+**
+**************************************************************************/
+void bulkdata_process_profile_file(bulkdata_profile_t *bp)
+{
+    int err;
+    char path[MAX_DM_PATH];
+    report_t *cur_report;
+    char *json_report;
+    char report_timestamp[33];
+    profile_ctrl_params_t ctrl;
+    FILE *fp = NULL;
+    char buf[48];
+
+    // Get control parameters
+    err = bulkdata_platform_get_profile_control_params(bp, &ctrl);
+    if (err != USP_ERR_OK)
+    {
+        USP_LOG_Error("%s: Failed to get control parameters for profile %d", __FUNCTION__, bp->profile_id);
+        DEVICE_BULKDATA_NotifyTransferResult(bp->profile_id, kBDCTransferResult_Failure_Other);
+        return;
+    }
+
+    // Validate file path
+    if (ctrl.file_path[0] == '\0')
+    {
+        USP_LOG_Error("%s: File path not set for profile %d", __FUNCTION__, bp->profile_id);
+        DEVICE_BULKDATA_NotifyTransferResult(bp->profile_id, kBDCTransferResult_Failure_Other);
+        return;
+    }
+
+    // Get ReportTimestamp
+    USP_SNPRINTF(path, sizeof(path), "Device.BulkData.Profile.%d.JSONEncoding.ReportTimestamp", bp->profile_id);
+    err = DATA_MODEL_GetParameterValue(path, report_timestamp, sizeof(report_timestamp), 0);
+    if (err != USP_ERR_OK)
+    {
+        USP_LOG_Error("%s: Failed to get ReportTimestamp for profile %d", __FUNCTION__, bp->profile_id);
+        DEVICE_BULKDATA_NotifyTransferResult(bp->profile_id, kBDCTransferResult_Failure_Other);
+        return;
+    }
+
+    // If not retrying, generate a new report
+    if (bp->retry_count == 0)
+    {
+        // Drop oldest reports if necessary
+        if (bp->num_retained_reports > ctrl.num_retained_failed_reports)
+        {
+            bulkdata_drop_oldest_retained_reports(bp, ctrl.num_retained_failed_reports);
+        }
+
+        // Initialize new report
+        cur_report = &bp->reports[bp->num_retained_reports];
+        cur_report->collection_time = time(NULL);
+        KV_VECTOR_Init(&cur_report->report_map);
+
+        // Generate report contents
+        err = bulkdata_calc_report_map(bp, &cur_report->report_map);
+        if (err != USP_ERR_OK)
+        {
+            USP_LOG_Error("%s: bulkdata_calc_report_map failed for profile %d", __FUNCTION__, bp->profile_id);
+            DEVICE_BULKDATA_NotifyTransferResult(bp->profile_id, kBDCTransferResult_Failure_Other);
+            return;
+        }
+        bp->num_retained_reports++;
+    }
+
+    // Generate JSON report
+    json_report = bulkdata_generate_json_report(bp, report_timestamp);
+    if (json_report == NULL)
+    {
+        USP_LOG_Error("%s: bulkdata_generate_json_report failed for profile %d", __FUNCTION__, bp->profile_id);
+        DEVICE_BULKDATA_NotifyTransferResult(bp->profile_id, kBDCTransferResult_Failure_Other);
+        return;
+    }
+
+    // Log the operation
+    USP_LOG_Info("\nBULK DATA: Writing at time %s to file %s", iso8601_cur_time(buf, sizeof(buf)), ctrl.file_path);
+    USP_LOG_Info("BULK DATA: Append mode=%s", ctrl.file_append ? "true" : "false");
+    if (enable_protocol_trace)
+    {
+        USP_LOG_String(kLogLevel_Info, kLogType_Protocol, json_report);
+    }
+
+    // Rotate file if necessary
+    bulkdata_rotate_file(ctrl.file_path);
+
+    // Open file
+    fp = fopen(ctrl.file_path, ctrl.file_append ? "a" : "w");
+    if (fp == NULL)
+    {
+        USP_LOG_Error("%s: Failed to open file %s for writing (%s)", __FUNCTION__, ctrl.file_path, strerror(errno));
+        free(json_report);
+        DEVICE_BULKDATA_NotifyTransferResult(bp->profile_id, kBDCTransferResult_Failure_Other);
+        return;
+    }
+
+    // Optimize buffering
+    setvbuf(fp, NULL, _IOFBF, 8192);
+
+    // Acquire file lock
+    if (flock(fileno(fp), LOCK_EX) != 0)
+    {
+        USP_LOG_Error("%s: Failed to lock file %s (%s)", __FUNCTION__, ctrl.file_path, strerror(errno));
+        fclose(fp);
+        free(json_report);
+        DEVICE_BULKDATA_NotifyTransferResult(bp->profile_id, kBDCTransferResult_Failure_Other);
+        return;
+    }
+
+    // Write JSON report
+    size_t written = fwrite(json_report, 1, strlen(json_report), fp);
+    if (written != strlen(json_report))
+    {
+        USP_LOG_Error("%s: Failed to write report to file %s (%s)", __FUNCTION__, ctrl.file_path, strerror(errno));
+        flock(fileno(fp), LOCK_UN);
+        fclose(fp);
+        free(json_report);
+        DEVICE_BULKDATA_NotifyTransferResult(bp->profile_id, kBDCTransferResult_Failure_Other);
+        return;
+    }
+
+    // Add newline for readability
+    if (ctrl.file_append)
+    {
+        fputc('\n', fp);
+    }
+
+    // Release lock and close file
+    flock(fileno(fp), LOCK_UN);
+    if (fclose(fp) != 0)
+    {
+        USP_LOG_Error("%s: Failed to close file %s (%s)", __FUNCTION__, ctrl.file_path, strerror(errno));
+        free(json_report);
+        DEVICE_BULKDATA_NotifyTransferResult(bp->profile_id, kBDCTransferResult_Failure_Other);
+        return;
+    }
+
+    // Free JSON report
+    free(json_report);
+
+    // Report successfully written
+    USP_LOG_Info("%s: Successfully wrote report to file %s for profile %d", __FUNCTION__, ctrl.file_path, bp->profile_id);
+    bulkdata_clear_retained_reports(bp);
+    bp->is_working = true;
+    DEVICE_BULKDATA_NotifyTransferResult(bp->profile_id, kBDCTransferResult_Success);
+
+    // Restart the sync timer
+    err = bulkdata_resync_profile(bp, NULL);
+    if (err != USP_ERR_OK)
+    {
+        USP_LOG_Error("%s: Failed to resync profile %d", __FUNCTION__, bp->profile_id);
+    }
+}
+
+/*********************************************************************//**
+**
+** bulkdata_rotate_file
+**
+** Rotates the file if it exceeds the maximum size
+**
+** \param   file_path - path to the file to rotate
+** \return  None
+**
+**************************************************************************/
+void bulkdata_rotate_file(char *file_path)
+{
+    struct stat st;
+    char old_path[MAX_DM_PATH];
+    char new_path[MAX_DM_PATH];
+    int i;
+
+    // Check file size
+    if (stat(file_path, &st) == 0 && st.st_size > BULKDATA_MAX_FILE_SIZE)
+    {
+        USP_LOG_Info("%s: Rotating file %s (size=%ld)", __FUNCTION__, file_path, (long)st.st_size);
+
+        // Shift existing backup files
+        for (i = BULKDATA_MAX_BACKUP_FILES - 1; i >= 0; i--)
+        {
+            USP_SNPRINTF(old_path, sizeof(old_path), "%s.%d", file_path, i);
+            USP_SNPRINTF(new_path, sizeof(new_path), "%s.%d", file_path, i + 1);
+            if (i == 0)
+            {
+                strcpy(old_path, file_path);
+            }
+            if (access(old_path, F_OK) == 0)
+            {
+                if (rename(old_path, new_path) != 0)
+                {
+                    USP_LOG_Error("%s: Failed to rename %s to %s (%s)", __FUNCTION__, old_path, new_path, strerror(errno));
+                }
+            }
+        }
+
+        // Remove oldest backup if it exists
+        USP_SNPRINTF(new_path, sizeof(new_path), "%s.%d", file_path, BULKDATA_MAX_BACKUP_FILES);
+        if (access(new_path, F_OK) == 0)
+        {
+            if (unlink(new_path) != 0)
+            {
+                USP_LOG_Error("%s: Failed to delete %s (%s)", __FUNCTION__, new_path, strerror(errno));
+            }
+        }
+    }
 }
 
 #ifdef ENABLE_MQTT
