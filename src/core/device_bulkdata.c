@@ -47,7 +47,8 @@
 #include <math.h>
 #include <zlib.h>
 #include <curl/curl.h>
-#include <sys/file.h> 
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
 
@@ -2764,6 +2765,9 @@ void bulkdata_process_profile_file(bulkdata_profile_t *bp)
     char *json_report;
     char report_timestamp[33];
     profile_ctrl_params_t ctrl;
+    combined_role_t *bulkdata_role;
+    combined_role_t combined_role;
+    int cont_instance;
     FILE *fp = NULL;
     char buf[48];
 
@@ -2773,6 +2777,13 @@ void bulkdata_process_profile_file(bulkdata_profile_t *bp)
     {
         USP_LOG_Error("%s: Failed to get control parameters for profile %d", __FUNCTION__, bp->profile_id);
         DEVICE_BULKDATA_NotifyTransferResult(bp->profile_id, kBDCTransferResult_Failure_Other);
+        return;
+    }
+
+    // Exit if unable to calculate the role to use when getting the parameters
+    err = bulkdata_platform_calc_combined_role(bp->profile_id, &bulkdata_role, &combined_role, &cont_instance);
+    if (err != USP_ERR_OK)
+    {
         return;
     }
 
@@ -2809,7 +2820,7 @@ void bulkdata_process_profile_file(bulkdata_profile_t *bp)
         KV_VECTOR_Init(&cur_report->report_map);
 
         // Generate report contents
-        err = bulkdata_calc_report_map(bp, &cur_report->report_map);
+        err = bulkdata_calc_report_map(bp, &cur_report->report_map, bulkdata_role);
         if (err != USP_ERR_OK)
         {
             USP_LOG_Error("%s: bulkdata_calc_report_map failed for profile %d", __FUNCTION__, bp->profile_id);
