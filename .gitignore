@@ -23,3 +23,4 @@ ylwrap
 *.m4
 .dirstamp
 *.swp
+.DS_Store
