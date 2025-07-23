@@ -16,12 +16,27 @@ include(GNUInstallDirs)
 set(OBUSPA_LOCAL_STATE_DIR ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LOCALSTATEDIR}/obuspa)
 message(STATUS "OBUSPA_LOCAL_STATE_DIR: ${OBUSPA_LOCAL_STATE_DIR}")
 
-option(ENABLE_STOMP "enable STOMP MTP support" ON)
-option(ENABLE_MQTT "enable MQTT MTP support" ON)
-option(ENABLE_COAP "enable CoAP MTP support" ON)
+option(ENABLE_STOMP "enable STOMP MTP support" OFF)
+option(ENABLE_MQTT "enable MQTT MTP support" OFF)
+option(ENABLE_COAP "enable CoAP MTP support" OFF)
 option(ENABLE_WEBSOCKETS "enable WebSockets MTP support" ON)
 option(ENABLE_UDS "enable UDS MTP support" ON)
 message(STATUS "MTP to support: STOMP:${ENABLE_STOMP} MQTT:${ENABLE_MQTT} COAP:${ENABLE_COAP} WEBSOCKETS:${ENABLE_WEBSOCKETS} UDS:${ENABLE_UDS}")
+
+# Find PkgConfig
+find_package(PkgConfig REQUIRED)
+
+# Find libwebsockets (required since ENABLE_WEBSOCKETS is ON)
+if (ENABLE_WEBSOCKETS)
+    pkg_check_modules(LIBWEBSOCKETS REQUIRED libwebsockets>=4.1.0)
+    if (LIBWEBSOCKETS_FOUND)
+        message(STATUS "Found libwebsockets: ${LIBWEBSOCKETS_VERSION}")
+        # Ensure library paths are included
+        link_directories(${LIBWEBSOCKETS_LIBRARY_DIRS})
+    else()
+        message(FATAL_ERROR "libwebsockets not found, required for ENABLE_WEBSOCKETS")
+    endif()
+endif()
 
 add_executable(obuspa
     src/core/main.c)
@@ -32,7 +47,9 @@ target_include_directories(obuspa
     src/include
     src/protobuf-c
     src/core
-    src/vendor)
+    src/vendor
+    ${LIBWEBSOCKETS_INCLUDE_DIRS}
+)
 
 # These definitions are needed because core/main.c requires these definitions.
 target_compile_definitions(obuspa
@@ -47,8 +64,16 @@ target_compile_definitions(obuspa
 
 target_link_libraries(obuspa
   PRIVATE
+    core
     vendor
-    core)
+    ${LIBWEBSOCKETS_LIBRARIES}
+)
+
+# Set library search paths for macOS
+if (APPLE)
+    link_directories(/opt/homebrew/lib /usr/local/lib)
+    include_directories(/opt/homebrew/include /usr/local/include)
+endif()
 
 add_subdirectory(src/libjson)
 add_subdirectory(src/protobuf-c)

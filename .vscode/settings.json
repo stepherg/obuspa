@@ -1,0 +1,15 @@
+{
+    "C_Cpp.vcFormat.newLine.beforeOpenBrace.namespace": "newLine",
+    "C_Cpp.vcFormat.newLine.beforeOpenBrace.block": "newLine",
+    "C_Cpp.vcFormat.newLine.beforeOpenBrace.function": "newLine",
+    "C_Cpp.vcFormat.newLine.beforeOpenBrace.lambda": "newLine",
+    "C_Cpp.vcFormat.newLine.beforeOpenBrace.type": "newLine",
+    "C_Cpp.vcFormat.newLine.scopeBracesOnSeparateLines": true,
+    "C_Cpp.vcFormat.indent.caseLabels": true,
+    "C_Cpp.vcFormat.indent.namespaceContents": false,
+    "editor.tabSize": 4,
+    "editor.detectIndentation": false,
+    "editor.formatOnPaste": false,
+    "editor.formatOnSave": false,
+    "editor.formatOnSaveMode": "modificationsIfAvailable"
+}

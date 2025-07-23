@@ -155,5 +155,8 @@ target_compile_options(core
     -Werror=parentheses
     -Wuninitialized
     -Werror=uninitialized
-    -Wpointer-arith
-    -Wno-portability)
+    -Wpointer-arith)
+
+if(!APPLE)
+  target_compile_options(core PRIVATE -Wno-portability)
+endif()
