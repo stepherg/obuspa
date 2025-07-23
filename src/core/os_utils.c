@@ -99,7 +99,11 @@ int OS_UTILS_CreateThread(const char* name, void *(* start_routine)(void *), voi
         goto exit;
     }
 
+#ifdef __APPLE__
+    err = pthread_setname_np(name);
+#else
     err = pthread_setname_np(thread, name);
+#endif    
     if (err != 0)
     {
         USP_ERR_ERRNO("pthread_setname_np", err);

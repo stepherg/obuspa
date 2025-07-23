@@ -36,19 +36,24 @@
 /**
  * @file nu_macaddr.c
  *
- * Network MAC utilty functions.
- *
+ * Network MAC utility functions for retrieving the WAN interface name and MAC address.
+ * Ensures compatibility with Linux and macOS using platform-specific ioctl calls.
  */
 
-#include <stdlib.h>
-#include <stdio.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
-
-#include <string.h>
 #include <net/if.h>
+#ifdef __linux__
+#include <net/if_arp.h>
+#endif
+#ifdef __APPLE__
+#include <net/if_dl.h>
+#endif
 #include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
 #include <errno.h>
+#include <stdint.h>
 
 #include "common_defs.h"
 #include "nu_macaddr.h"
@@ -77,67 +82,110 @@ char *nu_macaddr_wan_ifname(void)
 {
     char *e;
 
-    // Exit if the network interface was specified by the '-i command line option when invoking this executable
-    if (usp_interface != NULL)
-    {
+    // Check command-line option
+    if (usp_interface != NULL && *usp_interface != '\0') {
         return usp_interface;
     }
 
-    // Exit if an environment variable is used to override the interface name
-    // NOTE: This may be used with docker or with embedded systems still using the 'eth0' style naming convention
+    // Check environment variable for override (e.g., for Docker or embedded systems)
     e = getenv("USP_BOARD_IFNAME");
-    if ((e != NULL) && (*e != '\0'))
-    {
+    if (e != NULL && *e != '\0') {
         return e;
     }
 
+    // Fallback to default
     return DEFAULT_WAN_IFNAME;
 }
 
-/*********************************************************************//**
-**
-** nu_macaddr_wan_macaddr
-**
-** Returns the MAC address of the WAN interface
-**
-** \param   buf - pointer to buffer in which to return MAC address (6 bytes raw)
-**
-** \return  USP_ERR_OK if successful
-**
-**************************************************************************/
-int nu_macaddr_wan_macaddr(unsigned char *buf)
+/**
+ * @brief Retrieves the MAC address of the WAN interface.
+ *
+ * Uses platform-specific ioctl calls (SIOCGIFHWADDR on Linux, SIOCGIFMAC on macOS)
+ * to get the MAC address of the WAN interface. Ensures the interface name is valid
+ * and the output buffer is properly sized.
+ *
+ * @param buf Pointer to a buffer to store the 6-byte MAC address (must be at least MAC_ADDR_LEN bytes).
+ * @return USP_ERR_OK if successful, USP_ERR_INTERNAL_ERROR on failure.
+ */
+int nu_macaddr_wan_macaddr(uint8_t *buf)
 {
-    int err;
-    int sock;
-    struct ifreq ifr;
+    if (buf == NULL) {
+        USP_ERR_SetMessage("%s: Invalid buffer pointer", __FUNCTION__);
+        return USP_ERR_INTERNAL_ERROR;
+    }
 
-    // Set default return MAC address
+    // Initialize output buffer
     memset(buf, 0, MAC_ADDR_LEN);
 
-    // Set up which interface we want to get the MAC address of
-    memset(&ifr, 0x00, sizeof(ifr));
-    strcpy(ifr.ifr_name, nu_macaddr_wan_ifname());
-
-    // Attempt to get the MAC address of the interface
-    sock = socket(PF_INET, SOCK_DGRAM, 0);
-    if (sock == -1)
-    {
-        USP_ERR_SetMessage("%s: socket() failed. Unable to open a UDP socket (errno=%d, %m)", __FUNCTION__, errno);
+    // Get WAN interface name
+    const char *ifname = nu_macaddr_wan_ifname();
+    if (ifname == NULL || *ifname == '\0') {
+        USP_ERR_SetMessage("%s: No valid WAN interface name", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
 
+    // Ensure interface name fits within IFNAMSIZ
+    if (strlen(ifname) >= IFNAMSIZ) {
+        USP_ERR_SetMessage("%s: Interface name '%s' exceeds maximum length (%d)", __FUNCTION__, ifname, IFNAMSIZ - 1);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    // Set up ifreq structure
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    USP_STRNCPY(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
+
+    // Create a socket for ioctl
+    int sock = socket(PF_INET, SOCK_DGRAM, 0);
+    if (sock == -1) {
+        USP_ERR_SetMessage("%s: socket() failed (errno=%d: %s)", __FUNCTION__, errno, strerror(errno));
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    // Get MAC address using platform-specific ioctl
+    int err;
+#ifdef __linux__
     err = ioctl(sock, SIOCGIFHWADDR, &ifr);
-    close(sock);
-
-    // Exit if unable to get the MAC address of the interface
-    if (err == -1)
-    {
-        USP_ERR_SetMessage("%s: ioctl() failed. Unable to get MAC address for interface %s (errno=%d, %m)", __FUNCTION__, ifr.ifr_name, errno);
+    if (err == -1) {
+        USP_ERR_SetMessage("%s: ioctl(SIOCGIFHWADDR) failed for interface %s (errno=%d: %s)",
+                           __FUNCTION__, ifname, errno, strerror(errno));
+        close(sock);
         return USP_ERR_INTERNAL_ERROR;
     }
 
-    // Copy MAC address into return buffer
-    memcpy(buf, ifr.ifr_hwaddr.sa_data, MAC_ADDR_LEN);
+    // Verify address family
+    if (ifr.ifr_hwaddr.sa_family != ARPHRD_ETHER) {
+        USP_ERR_SetMessage("%s: Interface %s has invalid address family %d (expected ARPHRD_ETHER)",
+                           __FUNCTION__, ifname, ifr.ifr_hwaddr.sa_family);
+        close(sock);
+        return USP_ERR_INTERNAL_ERROR;
+    }
 
+    // Copy MAC address to output buffer
+    memcpy(buf, ifr.ifr_hwaddr.sa_data, MAC_ADDR_LEN);
+#elif defined(__APPLE__)
+    err = ioctl(sock, SIOCGIFMAC, &ifr);
+    if (err == -1) {
+        USP_ERR_SetMessage("%s: ioctl(SIOCGIFMAC) failed for interface %s (errno=%d: %s)",
+                           __FUNCTION__, ifname, errno, strerror(errno));
+        close(sock);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    // Verify address family
+    if (ifr.ifr_addr.sa_family != AF_LINK) {
+        USP_ERR_SetMessage("%s: Interface %s has invalid address family %d (expected AF_LINK)",
+                           __FUNCTION__, ifname, ifr.ifr_addr.sa_family);
+        close(sock);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    // Copy MAC address to output buffer
+    memcpy(buf, ifr.ifr_addr.sa_data, MAC_ADDR_LEN);
+#else
+    #error "Unsupported platform: Neither __linux__ nor __APPLE__ defined"
+#endif
+
+    close(sock);
     return USP_ERR_OK;
 }

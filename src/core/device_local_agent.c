@@ -46,7 +46,6 @@
 #include <time.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/sysinfo.h>
 
 #include "common_defs.h"
 #include "usp_api.h"

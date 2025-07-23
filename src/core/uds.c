@@ -64,6 +64,10 @@
 #include "os_utils.h"
 #include "iso8601.h"
 
+#include <time.h>
+#include "usp_api.h"
+
+
 //------------------------------------------------------------------------------
 // R-UDS.5 - When a UNIX domain socket connection is closed or fails to be established, the USP Endpoint acting as a client MUST attempt to re-establish
 // the UNIX domain socket within a random amount of time between 1 and 5 seconds
@@ -73,6 +77,10 @@
 #define RETRY_LATER true
 #define HANDSHAKE_TIMEOUT 30
 #define TLV_HEADER_SIZE 5
+
+#ifndef UNIX_PATH_MAX
+#define UNIX_PATH_MAX 104 // macOS has a limit of 104 bytes for sun_path
+#endif
 
 //------------------------------------------------------------------------------
 // one of these for each instantiated UDS server
@@ -1231,66 +1239,87 @@ exit:
 **************************************************************************/
 int StartUdsClient(uds_connection_t *uc)
 {
-    int err = USP_ERR_INTERNAL_ERROR;
-    int result;
     struct sockaddr_un addr;
     uds_send_item_t *send_item = NULL;
 
-    // type might be kUdsConnType_Retry if retrying after being disconnected
-    uc->type = kUdsConnType_Client;
-
-    // Create a new client connecting socket with domain: AF_UNIX, type: SOCK_STREAM, protocol: 0
-    uc->socket = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (uc->socket == -1)
-    {
-        USP_ERR_ERRNO("socket", errno);
-        err = USP_ERR_INTERNAL_ERROR;
-        goto exit;
+    if (uc == NULL || uc->socket_path == NULL) {
+        USP_ERR_SetMessage("%s: Invalid arguments (uc=%p, socket_path=%p)", __FUNCTION__, uc, uc ? uc->socket_path : NULL);
+        return USP_ERR_INTERNAL_ERROR;
     }
 
-    // Fill in the unix domain socket path
-    USP_ASSERT(uc->socket_path != NULL);
+    // Ensure socket path length is within limits
+    size_t path_len = strlen(uc->socket_path);
+    if (path_len >= UNIX_PATH_MAX) {
+        USP_ERR_SetMessage("%s: Socket path '%s' exceeds maximum length (%d)", __FUNCTION__, uc->socket_path, UNIX_PATH_MAX);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    // Set connection type
+    uc->type = kUdsConnType_Client;
+
+    // Create UDS socket
+    uc->socket = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (uc->socket == -1) {
+        USP_ERR_ERRNO("socket", errno);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    // Set socket to non-blocking mode
+    int flags = fcntl(uc->socket, F_GETFL, 0);
+    if (flags == -1 || fcntl(uc->socket, F_SETFL, flags | O_NONBLOCK) == -1) {
+        USP_ERR_ERRNO("fcntl", errno);
+        CloseUdsConnection(uc, DONT_RETRY);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    // Initialize sockaddr_un structure
     memset(&addr, 0, sizeof(struct sockaddr_un));
     addr.sun_family = AF_UNIX;
     USP_STRNCPY(addr.sun_path, uc->socket_path, sizeof(addr.sun_path));
 
-    // Exit if unable to connect
-    result = connect(uc->socket, (struct sockaddr *) &addr, sizeof(struct sockaddr_un));
-    if (result == -1)
-    {
-        // This may mean that the service we're connecting to isn't available yet
-        USP_LOG_Warning("%s: cannot connect to socket path %s", __FUNCTION__, uc->socket_path);
-        // close connection, set retry = true to re-attempt connection automatically
-        CloseUdsConnection(uc, RETRY_LATER);
-        // Because we are retrying the connection its okay to return success here
-        err = USP_ERR_OK;
-        goto exit;
+    // Attempt to connect
+    if (connect(uc->socket, (struct sockaddr *)&addr, sizeof(struct sockaddr_un)) == -1) {
+        if (errno == EINPROGRESS) {
+            // Non-blocking connect in progress; proceed with handshake setup
+        } else if (errno == ECONNREFUSED || errno == ENOENT) {
+            // Recoverable errors: service not available or socket file missing
+            USP_LOG_Warning("%s: Cannot connect to socket path %s (%s)", __FUNCTION__, uc->socket_path, strerror(errno));
+            CloseUdsConnection(uc, RETRY_LATER);
+            return USP_ERR_OK; // Retryable error, return success
+        } else {
+            // Non-recoverable error
+            USP_ERR_ERRNO("connect", errno);
+            CloseUdsConnection(uc, DONT_RETRY);
+            return USP_ERR_INTERNAL_ERROR;
+        }
     }
 
-    // Add USP Record to end of queue
+    // Allocate and initialize send item for handshake
     send_item = USP_MALLOC(sizeof(uds_send_item_t));
+    if (send_item == NULL) {
+        USP_ERR_SetMessage("%s: Failed to allocate memory for send_item", __FUNCTION__);
+        CloseUdsConnection(uc, DONT_RETRY);
+        return USP_ERR_INTERNAL_ERROR;
+    }
     memset(send_item, 0, sizeof(uds_send_item_t));
     send_item->expiry_time = END_OF_TIME;
     send_item->type = kUdsFrameType_Handshake;
     DLLIST_LinkToHead(&uc->usp_record_send_queue, send_item);
 
-    // UDS-18 if we don't receive a handshake within 30 seconds then we need to close the connection
-    time_t cur_time;
-    cur_time = time(NULL);
+    // Set handshake timeout (30 seconds from now)
+    time_t cur_time = time(NULL);
+    if (cur_time == (time_t)-1) {
+        USP_ERR_ERRNO("time", errno);
+        USP_FREE(send_item);
+        CloseUdsConnection(uc, DONT_RETRY);
+        return USP_ERR_INTERNAL_ERROR;
+    }
     uc->handshake_timeout = cur_time + HANDSHAKE_TIMEOUT;
-    // kick the MTP thread here to trigger recalc of the handshake timeout in UDS_UpdateAllSockSet
+
+    // Trigger MTP thread to recalculate handshake timeout
     MTP_EXEC_UdsWakeup();
 
-    err = USP_ERR_OK;
-
-exit:
-    // If a non-recoverable error occurred connecting to the server then clean up and return an error
-    if (err != USP_ERR_OK)
-    {
-        CloseUdsConnection(uc, DONT_RETRY);
-    }
-
-    return err;
+    return USP_ERR_OK;
 }
 
 /*********************************************************************//**
@@ -2090,44 +2119,48 @@ void PopUdsSendItem(uds_connection_t *uc)
 **************************************************************************/
 int HandleUdsListeningSocketConnection(uds_server_t *us)
 {
-    USP_ASSERT(us);
+    USP_ASSERT(us != NULL);
 
     int socket;
     uds_connection_t *uc = NULL;
-    struct sockaddr sa;
-    socklen_t sa_len;
+    struct sockaddr_un sa; // Use sockaddr_un to ensure sufficient size for UDS
+    socklen_t sa_len = sizeof(struct sockaddr_un);
 
-    // Exit if unable to accept the connection
-    sa_len = sizeof(sa);
-    socket = accept4(us->listen_sock, &sa, &sa_len, SOCK_NONBLOCK);
-    if (socket == -1)
-    {
-        // If an error occurred, just log it
+    // Accept the incoming connection
+    socket = accept(us->listen_sock, (struct sockaddr *)&sa, &sa_len);
+    if (socket == -1) {
         USP_ERR_ERRNO("accept", errno);
         return USP_ERR_INTERNAL_ERROR;
     }
 
-    // Exit if no free internal UDS connection entries
-    uc = FindFreeUdsConnection();
-    if (uc == NULL)
-    {
-        USP_LOG_Error("%s: Too many connections - ignoring connect request", __FUNCTION__);
-        close (socket);
+    // Set the socket to non-blocking mode
+    int flags = fcntl(socket, F_GETFL, 0);
+    if (flags == -1 || fcntl(socket, F_SETFL, flags | O_NONBLOCK) == -1) {
+        USP_ERR_ERRNO("fcntl", errno);
+        close(socket);
         return USP_ERR_INTERNAL_ERROR;
     }
 
-    // Fill in the UDS connection structure
+    // Find a free UDS connection slot
+    uc = FindFreeUdsConnection();
+    if (uc == NULL) {
+        USP_LOG_Error("%s: Too many connections - ignoring connect request", __FUNCTION__);
+        close(socket);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    // Initialize the UDS connection structure
     InitialiseUdsConnection(uc);
     uc->type = kUdsConnType_Server;
     uc->socket = socket;
     uc->conn_id = CalcNextUdsConnectionId();
     uc->instance = us->instance;
     uc->path_type = us->path_type;
-    uc->socket_path = NULL; // we don't need to remember socket path for server side connections - only clients attempt to reconnect after a disconnection
+    uc->socket_path = NULL; // Server-side connections do not need socket path
 
     DLLIST_Init(&uc->usp_record_send_queue);
 
-    // NOTE: The UDS handshake record is sent in response to the handshake message received from the client [R-UDS.17], rather than here
+    // NOTE: The UDS handshake record is sent in response to the client's handshake [R-UDS.17]
 
     return USP_ERR_OK;
 }

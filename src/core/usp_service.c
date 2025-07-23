@@ -55,7 +55,9 @@
 #include "usp_service.h"
 #include "path_resolver.h"
 
+#include <unistd.h>
 #include <semaphore.h>
+#include <fcntl.h>
 
 #ifndef REMOVE_USP_SERVICE
 //------------------------------------------------------------------------
@@ -1016,18 +1018,33 @@ int USP_SERVICE_RegisterNotificationCallback(usp_service_notify_cb_t cb)
 **************************************************************************/
 int PerformUspServiceRequest(usp_service_req_t *req, const char *caller)
 {
-    // Exit if called from the data model thread
-    // The USP-Service-as-controller API functions cannot be called from the data model thread, as that will cause deadlock
-    if (OS_UTILS_IsDataModelThread(caller, DONT_PRINT_WARNING))
-    {
-        USP_SNPRINTF(req->err_msg, req->err_msg_len, "%s() cannot be called from data model thread (would cause deadlock)", caller);
+#define SEM_NAME_MAX 64
+
+// Static counter for unique semaphore names
+static int sem_counter = 0;
+
+
+    sem_t *sem = SEM_FAILED;
+    char sem_name[SEM_NAME_MAX];
+    int err_code = USP_ERR_INTERNAL_ERROR;
+
+    if (req == NULL || caller == NULL || req->err_msg == NULL || req->err_msg_len <= 0) {
+        USP_SNPRINTF(req ? req->err_msg : NULL, req ? req->err_msg_len : 0,
+                     "%s: Invalid arguments (req=%p, caller=%p, err_msg=%p, err_msg_len=%d)",
+                     caller, req, caller, req ? req->err_msg : NULL, req ? req->err_msg_len : 0);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    // Exit if called from the data model thread (would cause deadlock)
+    if (OS_UTILS_IsDataModelThread(caller, DONT_PRINT_WARNING)) {
+        USP_SNPRINTF(req->err_msg, req->err_msg_len,
+                     "%s() cannot be called from data model thread (would cause deadlock)", caller);
         usp__msg__free_unpacked(req->req, pbuf_allocator);
         return USP_ERR_INTERNAL_ERROR;
     }
 
     // Exit if not running as a USP Service
-    if (RUNNING_AS_USP_SERVICE() == false)
-    {
+    if (!RUNNING_AS_USP_SERVICE()) {
         USP_SNPRINTF(req->err_msg, req->err_msg_len, "%s: Not running as a USP Service", caller);
         usp__msg__free_unpacked(req->req, pbuf_allocator);
         return USP_ERR_INTERNAL_ERROR;
@@ -1041,20 +1058,47 @@ int PerformUspServiceRequest(usp_service_req_t *req, const char *caller)
         return USP_ERR_INTERNAL_ERROR;
     }
 
-    // Default output args
+    // Initialize default response
     req->err_msg[0] = '\0';
     req->err_code = USP_ERR_INTERNAL_ERROR;
 
-    // Send request and wait for response
-    sem_init(&req->semaphore,0,0);
-    USP_PROCESS_DoWork( QueueUspServiceRequest, req, NULL);
-    sem_wait(&req->semaphore);
+    // Create a unique semaphore name
+    USP_SNPRINTF(sem_name, sizeof(sem_name), "/usp_service_%d_%d", getpid(), sem_counter++);
+    if (sem_counter >= 10000) { // Prevent overflow in counter
+        sem_counter = 0;
+    }
 
-    // Free resources created by this function and not being returned
-    sem_destroy(&req->semaphore);
+    // Create named semaphore (initial value 0, not shared between processes)
+    sem = sem_open(sem_name, O_CREAT | O_EXCL, 0600, 0);
+    if (sem == SEM_FAILED) {
+        USP_ERR_ERRNO("sem_open", errno);
+        USP_SNPRINTF(req->err_msg, req->err_msg_len, "%s: Failed to create semaphore %s", caller, sem_name);
+        usp__msg__free_unpacked(req->req, pbuf_allocator);
+        return USP_ERR_INTERNAL_ERROR;
+    }
+
+    // Send request and wait for response
+    USP_PROCESS_DoWork(QueueUspServiceRequest, req, NULL);
+    if (sem_wait(sem) != 0) {
+        USP_ERR_ERRNO("sem_wait", errno);
+        USP_SNPRINTF(req->err_msg, req->err_msg_len, "%s: Failed to wait on semaphore %s", caller, sem_name);
+        err_code = USP_ERR_INTERNAL_ERROR;
+    } else {
+        err_code = req->err_code;
+    }
+
+    // Clean up semaphore
+    if (sem_close(sem) != 0) {
+        USP_ERR_ERRNO("sem_close", errno);
+    }
+    if (sem_unlink(sem_name) != 0) {
+        USP_ERR_ERRNO("sem_unlink", errno);
+    }
+
+    // Free the USP request message
     usp__msg__free_unpacked(req->req, pbuf_allocator);
 
-    return req->err_code;
+    return err_code;
 }
 
 /*********************************************************************//**
